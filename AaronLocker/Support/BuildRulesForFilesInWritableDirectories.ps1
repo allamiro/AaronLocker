@@ -363,7 +363,7 @@ foreach($alfi in $arrALFI)
                     if ($pubRuleInclBinname -or $MSHighGranularity)
                     {
                         # File-specific rules: add binary name to key
-                        $key = "|" + $pubInfo.BinaryName
+                        $key += "|" + $pubInfo.BinaryName
 
                         # File-specific name/description including full path
                         $rule.Name = $RuleNamePrefix + $pubInfo.BinaryName
