@@ -27,6 +27,14 @@ as the input file and with the same file name but with the default Excel file ex
 
 .PARAMETER RawEventCounts
 If the -RawEventCounts switch is specified, workbook includes additional worksheets focused on raw event counts per machine, per user, and per publisher.
+
+.PARAMETER VirusTotalLookup
+If the -VirusTotalLookup switch is specified, the script queries VirusTotal API for SHA256 hashes found in unsigned files and adds VirusTotal threat intelligence data to the "Unsigned file info" worksheet.
+
+.PARAMETER VirusTotalApiKey
+VirusTotal API key required when using -VirusTotalLookup. If not provided, the script will prompt for it.
+You can get a free API key from https://www.virustotal.com/gui/join-us
+Free tier allows 4 requests per minute; the script automatically handles rate limiting.
 #>
 
 [CmdletBinding(DefaultParameterSetName="GenerateTempCsv")]
@@ -41,13 +49,143 @@ param(
     $SaveWorkbook,
 
     [switch]
-    $RawEventCounts
+    $RawEventCounts,
+
+    [switch]
+    $VirusTotalLookup,
+
+    [parameter(Mandatory=$false)]
+    [String]
+    $VirusTotalApiKey
 )
 
 $rootDir = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path)
 # Get configuration settings and global functions from .\Support\Config.ps1)
 # Dot-source the config file. Contains Excel-generation scripts.
 . $rootDir\Support\Config.ps1
+
+# Function to normalize hash (remove 0x prefix, uppercase, validate)
+function Normalize-Hash {
+    param([string]$hash)
+    
+    if ([string]::IsNullOrWhiteSpace($hash))
+    {
+        return $null
+    }
+    
+    $hash = $hash.Trim()
+    
+    # Remove "0x" prefix if present
+    if ($hash.StartsWith("0x", [System.StringComparison]::InvariantCultureIgnoreCase))
+    {
+        $hash = $hash.Substring(2)
+    }
+    
+    # Remove any whitespace
+    $hash = $hash -replace '\s', ''
+    
+    # Validate it's a hex string of correct length (SHA256 = 64 hex chars)
+    if ($hash.Length -eq 64 -and $hash -match '^[0-9A-Fa-f]+$')
+    {
+        return $hash.ToUpper()
+    }
+    
+    return $null
+}
+
+# Function to query VirusTotal API v2
+function Get-VirusTotalReport {
+    param(
+        [string]$hash,
+        [string]$apiKey
+    )
+    
+    $hash = Normalize-Hash -hash $hash
+    if ($null -eq $hash)
+    {
+        return @{
+            Status = "Invalid"
+            Detections = 0
+            TotalScans = 0
+            ScanDate = ""
+            Permalink = ""
+            Error = "Invalid hash format"
+        }
+    }
+    
+    # Use v2 API (widely compatible, still supported)
+    # v2 API uses apikey and resource as query parameters for GET requests
+    $uri = "https://www.virustotal.com/vtapi/v2/file/report?apikey=$apiKey&resource=$hash"
+    
+    try
+    {
+        $response = Invoke-RestMethod -Uri $uri -Method Get -ErrorAction Stop
+        
+        if ($response.response_code -eq 1)
+        {
+            # Hash found in VirusTotal
+            return @{
+                Status = "Found"
+                Detections = $response.positives
+                TotalScans = $response.total
+                ScanDate = if ($response.scan_date) { $response.scan_date } else { "" }
+                Permalink = if ($response.permalink) { $response.permalink } else { "" }
+                Error = ""
+            }
+        }
+        elseif ($response.response_code -eq 0)
+        {
+            # Hash not found in VirusTotal
+            return @{
+                Status = "Not Found"
+                Detections = 0
+                TotalScans = 0
+                ScanDate = ""
+                Permalink = ""
+                Error = ""
+            }
+        }
+        else
+        {
+            return @{
+                Status = "Error"
+                Detections = 0
+                TotalScans = 0
+                ScanDate = ""
+                Permalink = ""
+                Error = "Unknown response code: $($response.response_code)"
+            }
+        }
+    }
+    catch
+    {
+        $errorMsg = $_.Exception.Message
+        if ($_.Exception.Response)
+        {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            $errorMsg = "HTTP $statusCode : $errorMsg"
+            
+            # Handle rate limiting
+            if ($statusCode -eq 204)
+            {
+                $errorMsg = "Rate limit exceeded. Please increase delay."
+            }
+            elseif ($statusCode -eq 403)
+            {
+                $errorMsg = "API key invalid or insufficient privileges."
+            }
+        }
+        
+        return @{
+            Status = "Error"
+            Detections = 0
+            TotalScans = 0
+            ScanDate = ""
+            Permalink = ""
+            Error = $errorMsg
+        }
+    }
+}
 
 $OutputEncodingPrevious = $OutputEncoding
 $OutputEncoding = [System.Text.ASCIIEncoding]::Unicode
@@ -185,8 +323,133 @@ if (CreateExcelApplication)
         # Analysis of unsigned files:
         $tabname = "Unsigned file info"
         Write-Host "Gathering data for `"$tabname`"..." -ForegroundColor Cyan
-        $csv = @($eventsUnsigned | Select-Object Location, GenericPath, FileName, FileType, Hash | Sort-Object Location, GenericPath -Unique | ConvertTo-Csv -Delimiter "`t" -NoTypeInformation)
-        AddWorksheetFromCsvData -csv $csv -tabname $tabname
+        
+        if ($VirusTotalLookup)
+        {
+            # Get API key if not provided
+            if ([string]::IsNullOrEmpty($VirusTotalApiKey))
+            {
+                $secureKey = Read-Host "Enter VirusTotal API Key" -AsSecureString
+                $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
+                $VirusTotalApiKey = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+            }
+            
+            if ([string]::IsNullOrEmpty($VirusTotalApiKey))
+            {
+                Write-Warning "VirusTotal API key is required for -VirusTotalLookup. Skipping VirusTotal lookup."
+                $VirusTotalLookup = $false
+            }
+            else
+            {
+                Write-Host "Querying VirusTotal for unsigned file hashes..." -ForegroundColor Cyan
+                
+                # Get unique hashes from unsigned events
+                $uniqueHashes = @{}
+                $hashToEvents = @{}
+                foreach ($event in $eventsUnsigned)
+                {
+                    if ($event.Hash -and $event.Hash -ne "(not reported)")
+                    {
+                        $normalized = Normalize-Hash -hash $event.Hash
+                        if ($null -ne $normalized -and !$uniqueHashes.ContainsKey($normalized))
+                        {
+                            $uniqueHashes[$normalized] = $true
+                            $hashToEvents[$normalized] = @()
+                        }
+                        if ($null -ne $normalized)
+                        {
+                            $hashToEvents[$normalized] += $event
+                        }
+                    }
+                }
+                
+                Write-Host "Found $($uniqueHashes.Count) unique hashes to query. This may take a while due to rate limiting..." -ForegroundColor Cyan
+                
+                # Query VirusTotal for each unique hash
+                $vtResults = @{}
+                $queryCount = 0
+                $totalQueries = $uniqueHashes.Count
+                $delaySeconds = 15  # Free tier allows 4 requests per minute
+                
+                foreach ($hash in $uniqueHashes.Keys)
+                {
+                    $queryCount++
+                    Write-Progress -Activity "Querying VirusTotal" -Status "Query $queryCount of $totalQueries" -PercentComplete (($queryCount / $totalQueries) * 100)
+                    
+                    Write-Host "[$queryCount/$totalQueries] Querying hash: $hash" -ForegroundColor Cyan
+                    $result = Get-VirusTotalReport -hash $hash -apiKey $VirusTotalApiKey
+                    $vtResults[$hash] = $result
+                    
+                    # Rate limiting: wait between requests (except for last one)
+                    if ($queryCount -lt $totalQueries)
+                    {
+                        Start-Sleep -Seconds $delaySeconds
+                    }
+                }
+                
+                Write-Progress -Activity "Querying VirusTotal" -Completed
+                
+                # Merge VirusTotal results into events
+                $eventsUnsignedWithVT = @()
+                foreach ($event in $eventsUnsigned)
+                {
+                    $normalized = Normalize-Hash -hash $event.Hash
+                    if ($null -ne $normalized -and $vtResults.ContainsKey($normalized))
+                    {
+                        $vtResult = $vtResults[$normalized]
+                        $eventsUnsignedWithVT += [PSCustomObject]@{
+                            Location = $event.Location
+                            GenericPath = $event.GenericPath
+                            FileName = $event.FileName
+                            FileType = $event.FileType
+                            Hash = $event.Hash
+                            VT_Status = $vtResult.Status
+                            VT_Detections = $vtResult.Detections
+                            VT_TotalScans = $vtResult.TotalScans
+                            VT_ScanDate = $vtResult.ScanDate
+                            VT_Permalink = $vtResult.Permalink
+                            VT_Error = $vtResult.Error
+                        }
+                    }
+                    else
+                    {
+                        # Event with invalid or missing hash
+                        $eventsUnsignedWithVT += [PSCustomObject]@{
+                            Location = $event.Location
+                            GenericPath = $event.GenericPath
+                            FileName = $event.FileName
+                            FileType = $event.FileType
+                            Hash = $event.Hash
+                            VT_Status = if ($null -eq $normalized) { "Invalid Hash" } else { "Not Queried" }
+                            VT_Detections = ""
+                            VT_TotalScans = ""
+                            VT_ScanDate = ""
+                            VT_Permalink = ""
+                            VT_Error = if ($null -eq $normalized) { "Invalid or missing hash" } else { "" }
+                        }
+                    }
+                }
+                
+                # Create CSV with VirusTotal columns
+                # Group by Location and GenericPath to get unique combinations, taking first occurrence of each
+                $uniqueEvents = $eventsUnsignedWithVT | Group-Object -Property Location, GenericPath | ForEach-Object { $_.Group[0] }
+                $csv = @($uniqueEvents | Sort-Object Location, GenericPath | ConvertTo-Csv -Delimiter "`t" -NoTypeInformation)
+                AddWorksheetFromCsvData -csv $csv -tabname $tabname
+                
+                # Summary
+                $foundCount = ($vtResults.Values | Where-Object { $_.Status -eq "Found" }).Count
+                $detectedCount = ($vtResults.Values | Where-Object { $_.Status -eq "Found" -and $_.Detections -gt 0 }).Count
+                Write-Host "VirusTotal lookup complete: $foundCount hashes found, $detectedCount with detections" -ForegroundColor $(if ($detectedCount -gt 0) { "Yellow" } else { "Green" })
+            }
+        }
+        
+        if (!$VirusTotalLookup)
+        {
+            # Standard unsigned file info without VirusTotal
+            $csv = @($eventsUnsigned | Select-Object Location, GenericPath, FileName, FileType, Hash | Sort-Object Location, GenericPath -Unique | ConvertTo-Csv -Delimiter "`t" -NoTypeInformation)
+            AddWorksheetFromCsvData -csv $csv -tabname $tabname
+        }
     }
 
     if ($nEvents -gt 0)
